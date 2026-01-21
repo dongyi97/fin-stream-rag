@@ -1,0 +1,11 @@
+# FROM apache/airflow:2.8.1-python3.10
+FROM apache/airflow:latest
+
+USER root
+# 크롤링을 위한 최소 패키지 설치
+RUN apt-get update && apt-get install -y wget unzip && apt-get clean
+
+USER airflow
+# 도커 전용 requirements 파일 복사 및 설치
+COPY requirements-docker.txt /requirements-docker.txt
+RUN pip install --no-cache-dir -r /requirements-docker.txt
