@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+duckdb
+pymilvus
+langchain
+langchain-openai
+yfinance
+kafka-python
+pandas
+boto3
