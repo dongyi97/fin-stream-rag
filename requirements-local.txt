@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 duckdb
-pymilvus
+qdrant-client
 langchain
 langchain-openai
+langchain-qdrant
 yfinance
 kafka-python
 pandas
