@@ -13,3 +13,5 @@ feedparser
 selenium
 webdriver-manager
 trafilatura
+confluent-kafka
+websocket-client
