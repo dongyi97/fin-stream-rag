@@ -9,3 +9,6 @@ yfinance
 kafka-python
 pandas
 boto3
+feedparser
+selenium
+webdriver-manager
