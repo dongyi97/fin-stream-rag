@@ -1,6 +1,7 @@
 import json
 import time
-from datetime import datetime
+import re
+from datetime import datetime, timezone, timedelta
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
@@ -8,10 +9,10 @@ import trafilatura
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
 
 
 def create_kafka_producer(bootstrap_servers='localhost:9092'):
@@ -55,6 +56,33 @@ def send_to_kafka(producer, topic, article_data, key=None):
         return False
 
 
+def parse_coinness_date(date_str, time_str):
+    """'2026년 1월 23일 금요일' 과 '13:09'를 datetime으로 변환 (UTC 기준)"""
+    try:
+        # 날짜 문자열에서 숫자 추출 (년, 월, 일)
+        numbers = re.findall(r'\d+', date_str)
+        if len(numbers) >= 3:
+            year, month, day = map(int, numbers[:3])
+        else:
+            # 날짜 파싱 실패 시 오늘 날짜 사용 (UTC)
+            now_utc = datetime.now(timezone.utc)
+            year, month, day = now_utc.year, now_utc.month, now_utc.day
+        
+        # 시간 문자열 파싱 (HH:MM 형식) - 이미 UTC 기준
+        hour, minute = map(int, time_str.split(':'))
+        
+        # UTC timezone으로 datetime 생성
+        return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    except Exception as e:
+        print(f"⚠️ 날짜/시간 파싱 실패: {e}, 오늘 날짜 사용")
+        now_utc = datetime.now(timezone.utc)
+        try:
+            hour, minute = map(int, time_str.split(':'))
+            return now_utc.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except:
+            return now_utc
+
+
 def extract_article_content(url):
     """trafilatura를 사용하여 기사 본문 추출"""
     try:
@@ -81,8 +109,16 @@ def extract_article_content(url):
         return None
 
 
-def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='localhost:9092', num_articles=None):
-    """Coinness Newsroom 기사를 크롤링하고 Kafka에 전송"""
+def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='localhost:9092', num_articles=None, since_datetime=None, selenium_url='http://selenium-chrome:4444/wd/hub'):
+    """Coinness Newsroom 기사를 크롤링하고 Kafka에 전송
+    
+    Args:
+        topic_name: Kafka 토픽 이름
+        bootstrap_servers: Kafka 서버 주소
+        num_articles: 처리할 최대 기사 수 (None이면 전체)
+        since_datetime: 이 시간 이후의 뉴스만 가져옴 (datetime 객체, timezone-aware)
+        selenium_url: Selenium Grid Hub URL (기본값: Docker 네트워크 내부 주소)
+    """
     
     # Kafka Producer 생성
     try:
@@ -91,16 +127,35 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
         print(f"❌ Kafka Producer 생성 실패로 종료합니다: {e}")
         return
     
-    # 브라우저 설정
+    # 브라우저 설정 (캐시 및 세션 문제 해결)
     chrome_options = Options()
+    chrome_options.add_argument("--incognito")  # 시크릿 모드 (캐시/쿠키 완전 제거)
+    chrome_options.add_argument("--disable-cache")  # 캐시 비활성화
+    chrome_options.add_argument("--disable-application-cache")  # 애플리케이션 캐시 비활성화
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--headless")  # 원격 Selenium은 headless 권장
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    wait = WebDriverWait(driver, 15)
+    # Remote WebDriver 사용 (매 실행마다 새로운 세션)
+    print(f"🔗 Selenium 연결: {selenium_url}")
+    driver = None
+    try:
+        driver = webdriver.Remote(
+            command_executor=selenium_url,
+            options=chrome_options
+        )
+        print(f"✅ 새로운 브라우저 세션 생성 완료 (Session ID: {driver.session_id})")
+        wait = WebDriverWait(driver, 15)
+    except Exception as e:
+        print(f"❌ Selenium 연결 실패: {e}")
+        producer.flush()
+        producer.close()
+        return
     
     success_count = 0
     fail_count = 0
@@ -109,6 +164,12 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
         url = "https://coinness.com/article"
         print(f"\n📡 페이지 접속: {url}")
         driver.get(url)
+        
+        # 캐시 방지: 쿠키 삭제 및 강제 새로고침
+        driver.delete_all_cookies()
+        time.sleep(2)  # 쿠키 삭제 후 대기
+        driver.refresh()  # 강제 새로고침
+        time.sleep(5)  # AJAX 데이터 로드 대기 (매우 중요!)
         
         # 메인 컨테이너(ArticleListContainer 포함 클래스)가 나타날 때까지 대기
         print("브라우저 렌더링 대기 중...")
@@ -125,11 +186,11 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
         
         print(f"✅ 총 {total_articles}개의 기사를 발견했습니다. {len(articles)}개를 처리합니다.\n")
         
+        processed_count = 0
+        skipped_count = 0
+        
         for idx, article in enumerate(articles, 1):
             try:
-                print(f"{'='*60}")
-                print(f"[{idx}/{len(articles)}] 기사 처리 중...")
-                
                 # --- 1) 시간 및 날짜 추출 (TimeWrap 포함 클래스 내부) ---
                 time_wrap = article.find_element(By.XPATH, ".//*[contains(@class, 'TimeWrap')]")
                 
@@ -137,11 +198,35 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
                 try:
                     time_val = time_wrap.find_element(By.CLASS_NAME, "time-badge").text.strip()
                 except:
-                    time_val = "시간 정보 없음"
+                    time_val = "00:00"  # 기본값
                 
                 # TimeWrap의 전체 텍스트에서 시간 부분을 제외하여 날짜 정보 추출
                 full_time_text = time_wrap.text.replace(time_val, "").strip()
                 date_val = full_time_text if full_time_text else "날짜 정보 없음"
+                
+                # 시간 필터링 로직 (UTC 기준)
+                if since_datetime:
+                    try:
+                        # 날짜와 시간을 datetime으로 변환 (UTC 기준)
+                        published_dt_utc = parse_coinness_date(date_val, time_val)
+                        
+                        # since_datetime이 timezone-aware가 아니면 UTC로 가정
+                        if since_datetime.tzinfo is None:
+                            since_utc = since_datetime.replace(tzinfo=timezone.utc)
+                        else:
+                            since_utc = since_datetime.astimezone(timezone.utc)
+                        
+                        # UTC 기준으로 직접 비교
+                        if published_dt_utc <= since_utc:
+                            skipped_count += 1
+                            print(f"⏩ 스킵 [{idx}]: 발행시간 {published_dt_utc} UTC (기준시간: {since_utc} UTC)")
+                            continue
+                    except Exception as e:
+                        print(f"⚠️ [{idx}] 시간 필터링 실패: {e}. 계속 진행합니다.")
+                
+                processed_count += 1
+                print(f"{'='*60}")
+                print(f"[{processed_count}] 기사 처리 중 (전체 {idx}/{len(articles)})...")
                 
                 # --- 2) 기사 제목 추출 (ArticleTitle 포함 클래스 내부) ---
                 title_val = article.find_element(By.XPATH, ".//*[contains(@class, 'ArticleTitle')]").text.strip()
@@ -154,6 +239,7 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
                 
                 print(f"⏰ 시간: {time_val}")
                 print(f"📅 날짜: {date_val}")
+                print(f"📅 Published At UTC: {published_dt_utc}")
                 print(f"📌 제목: {title_val}")
                 print(f"🔗 링크: {link_val}")
                 
@@ -180,18 +266,30 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
                 
                 print(f"✅ 본문 크롤링 완료 (길이: {len(content_text)}자)")
                 
+                # UTC 시간으로 변환 (이미 UTC 기준이므로 변환 없이 직접 사용)
+                try:
+                    published_dt_utc = parse_coinness_date(date_val, time_val)
+                    published_at_iso = published_dt_utc.isoformat()
+                    published_at_str = published_dt_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+                except Exception as e:
+                    print(f"⚠️ 시간 변환 실패: {e}, 현재 시간 사용")
+                    published_at_iso = datetime.now(timezone.utc).isoformat()
+                    published_at_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                
                 # Kafka에 전송할 데이터 구조화
                 article_data = {
                     "title": content_title or title_val,
                     "content": content_text,
-                    "time": time_val,
-                    "date": date_val,
-                    "published_at": content_date or f"{date_val} {time_val}",
+                    "time": time_val,  # 원본 시간 문자열 (UTC)
+                    "date": date_val,  # 원본 날짜 문자열 (UTC)
+                    "published_at": published_at_iso,  # UTC ISO 형식
+                    "published_at_display": published_at_str,  # UTC 읽기 쉬운 형식
+                    "published_at_timezone": "UTC",
                     "link": link_val,
                     "author": content_author,
                     "source": "coinness",
                     "news_type": "newsroom",
-                    "crawled_at": datetime.now().isoformat(),
+                    "crawled_at": datetime.now(timezone.utc).isoformat(),  # UTC
                     "content_length": len(content_text),
                     "trafilatura_metadata": {
                         "rawtitle": article_content.get('rawtitle', ''),
@@ -232,6 +330,7 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
         print(f"📊 크롤링 완료 통계")
         print(f"✅ 성공: {success_count}개")
         print(f"❌ 실패: {fail_count}개")
+        print(f"⏩ 스킵: {skipped_count}개 (시간 필터링)")
         print(f"📝 총 처리: {success_count + fail_count}개")
         print(f"{'='*60}")
     
@@ -241,11 +340,22 @@ def fetch_coinness_newsroom(topic_name='coinness-newsroom', bootstrap_servers='l
         traceback.print_exc()
     
     finally:
+        # 반드시 브라우저 세션 종료 (캐시/세션 문제 해결의 핵심!)
+        if driver:
+            try:
+                print("🧹 브라우저 세션 정리 중...")
+                driver.quit()
+                print("✅ 브라우저 세션 종료 완료")
+            except Exception as e:
+                print(f"⚠️ 브라우저 종료 중 오류 (무시 가능): {e}")
+        
         # Producer 종료 전 모든 메시지 전송 완료 대기
-        producer.flush()
-        producer.close()
-        driver.quit()
-        print("✅ 브라우저 종료 완료")
+        try:
+            producer.flush()
+            producer.close()
+            print("✅ Kafka Producer 종료 완료")
+        except Exception as e:
+            print(f"⚠️ Producer 종료 중 오류: {e}")
 
 
 if __name__ == "__main__":
@@ -253,10 +363,14 @@ if __name__ == "__main__":
     TOPIC_NAME = "coinness-newsroom"
     BOOTSTRAP_SERVERS = "localhost:9092"
     NUM_ARTICLES = None  # None이면 모든 기사 처리, 숫자를 지정하면 해당 개수만 처리
+    SELENIUM_URL = "http://localhost:4444/wd/hub"  # 로컬 실행 시
+    # since_datetime = datetime.now(timezone.utc) - timedelta(minutes=5)  # 최근 5분간
     
     fetch_coinness_newsroom(
         topic_name=TOPIC_NAME,
         bootstrap_servers=BOOTSTRAP_SERVERS,
-        num_articles=NUM_ARTICLES
+        num_articles=NUM_ARTICLES,
+        since_datetime=None,  # None이면 필터링 안 함
+        selenium_url=SELENIUM_URL
     )
 
