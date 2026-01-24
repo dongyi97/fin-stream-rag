@@ -120,6 +120,8 @@ services:
     ports:
       - "8083:8080"   # Master Web UI (host -> container 8080)
       - "7077:7077"   # Master RPC
+    volumes:
+    - ./kafka_fin/consumer:/opt/app
     command: >
       /bin/bash -c "
       /opt/spark/sbin/start-master.sh &&
