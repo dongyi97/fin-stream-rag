@@ -1,7 +1,9 @@
 yfinance
 kafka-python
 pandas
+pyarrow
 selenium
 beautifulsoup4
 feedparser
 trafilatura
+boto3
