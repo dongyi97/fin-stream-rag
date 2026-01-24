@@ -73,7 +73,28 @@ services:
       - ./qdrant_storage:/qdrant/storage
     restart: always
 
-  # 4. Orchestrator (Custom Build)
+  # 4. Selenium Standalone Chrome (Remote WebDriver)
+  selenium-chrome:
+    image: selenium/standalone-chrome:latest
+    container_name: selenium-chrome
+    networks:
+      - fin-network
+    ports:
+      - "4444:4444"   # Selenium Grid Hub
+      - "7900:7900"   # VNC (선택적, 디버깅용)
+    environment:
+      - SE_VNC_NO_PASSWORD=1
+      - SE_NODE_MAX_SESSIONS=5
+      - SE_NODE_SESSION_TIMEOUT=300
+    shm_size: 2gb
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 5. Orchestrator (Custom Build)
 
   airflow:
     build:
@@ -82,8 +103,11 @@ services:
     container_name: airflow-standalone
     volumes:
       - ./dags:/opt/airflow/dags
+      - ./kafka_fin:/opt/airflow/kafka_fin
     ports:
       - "8080:8080"
+    networks:
+      - fin-network
     command: airflow standalone
 
 
