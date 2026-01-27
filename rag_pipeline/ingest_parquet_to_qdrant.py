@@ -4,6 +4,10 @@ MinIO Parquet → Qdrant 임베딩 적재 모듈
 이 모듈은 Airflow DAG에서 호출되어 특정 시간대의 Parquet 파일을 읽고,
 OpenAI 임베딩을 생성하여 Qdrant에 적재합니다.
 
+특징:
+- URL 기반 중복 체크: 이미 적재된 기사는 스킵 (OpenAI API 비용 절약)
+- Payload Index: url 필드에 인덱스를 생성하여 중복 체크 성능 최적화
+
 사용 예시:
     # 전체 데이터 적재 (로컬 테스트용)
     python ingest_parquet_to_qdrant.py
@@ -17,7 +21,7 @@ import os
 import uuid
 import logging
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import duckdb
 import pandas as pd
@@ -67,7 +71,7 @@ class Config:
 # =============================================================================
 
 def get_qdrant_client() -> QdrantClient:
-    """Qdrant 클라이언트 생성 및 컬렉션 초기화"""
+    """Qdrant 클라이언트 생성 및 컬렉션 초기화 (URL 인덱스 포함)"""
     client = QdrantClient(host=Config.QDRANT_HOST, port=Config.QDRANT_PORT)
     
     # 컬렉션이 없으면 생성
@@ -80,8 +84,35 @@ def get_qdrant_client() -> QdrantClient:
             ),
         )
         logger.info(f"Created Qdrant collection: {Config.COLLECTION_NAME}")
+        
+        # URL 필드에 Payload Index 생성 (중복 체크 성능 최적화)
+        client.create_payload_index(
+            collection_name=Config.COLLECTION_NAME,
+            field_name="url",
+            field_schema="keyword",  # 문자열 완전 일치 검색용
+        )
+        logger.info(f"Created payload index on 'url' field")
     
     return client
+
+
+def ensure_url_index(client: QdrantClient) -> None:
+    """
+    기존 컬렉션에 URL 인덱스가 없으면 생성
+    (이미 컬렉션이 있는 경우를 위한 함수)
+    """
+    try:
+        collection_info = client.get_collection(Config.COLLECTION_NAME)
+        # payload_schema에 url 인덱스가 있는지 확인
+        if collection_info.payload_schema and "url" not in collection_info.payload_schema:
+            client.create_payload_index(
+                collection_name=Config.COLLECTION_NAME,
+                field_name="url",
+                field_schema="keyword",
+            )
+            logger.info("Created payload index on 'url' field for existing collection")
+    except Exception as e:
+        logger.warning(f"Could not check/create url index: {e}")
 
 
 def get_openai_client() -> OpenAI:
@@ -103,6 +134,43 @@ def get_duckdb_connection():
         SET s3_url_style='path';
     """)
     return con
+
+
+# =============================================================================
+# 중복 체크 함수
+# =============================================================================
+
+def is_url_exists(client: QdrantClient, url: str) -> bool:
+    """
+    Qdrant에서 URL로 중복 체크 (임베딩 없이 빠르게 조회)
+    
+    Args:
+        client: Qdrant 클라이언트
+        url: 확인할 기사 URL
+    
+    Returns:
+        True면 이미 존재, False면 새 기사
+    """
+    if not url:
+        return False
+    
+    try:
+        # 딕셔너리 형태로 필터링 (최신 qdrant-client 지원)
+        existing_points, _ = client.scroll(
+            collection_name=Config.COLLECTION_NAME,
+            scroll_filter={
+                "must": [
+                    {"key": "url", "match": {"value": url}}
+                ]
+            },
+            limit=1,
+            with_vectors=False,  # 중복 확인용이니 벡터는 필요 없음
+            with_payload=False,  # payload도 필요 없음
+        )
+        return len(existing_points) > 0
+    except Exception as e:
+        logger.warning(f"Error checking URL existence: {e}")
+        return False  # 에러 시 새 기사로 간주하고 진행
 
 
 # =============================================================================
@@ -164,16 +232,16 @@ def embed_and_upload(
     df: pd.DataFrame,
     qdrant_client: QdrantClient,
     openai_client: OpenAI,
-) -> int:
+) -> dict:
     """
-    DataFrame의 기사들을 임베딩하고 Qdrant에 적재
+    DataFrame의 기사들을 임베딩하고 Qdrant에 적재 (URL 기반 중복 체크 포함)
     
     Returns:
-        적재된 청크 수
+        처리 결과 딕셔너리 (적재 청크 수, 스킵된 기사 수 등)
     """
     if df.empty:
         logger.info("No data to process")
-        return 0
+        return {"chunks_uploaded": 0, "articles_skipped": 0, "articles_processed": 0}
     
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=Config.CHUNK_SIZE,
@@ -183,18 +251,33 @@ def embed_and_upload(
     
     points = []
     total_uploaded = 0
+    articles_skipped = 0
+    articles_processed = 0
     
     for index, row in df.iterrows():
         content = row.get("content")
+        url = row.get("link")
+        
         if not content:
             continue
+        
+        # =====================================================================
+        # URL 기반 중복 체크 (임베딩 전에 확인!)
+        # =====================================================================
+        if is_url_exists(qdrant_client, url):
+            logger.info(f"Skipped (duplicate): {url}")
+            articles_skipped += 1
+            continue
+        
+        # 새 기사 처리
+        articles_processed += 1
         
         # 텍스트 청킹
         chunks = text_splitter.split_text(str(content))
         
         for i, chunk_text in enumerate(chunks):
             try:
-                # OpenAI 임베딩 생성
+                # OpenAI 임베딩 생성 (새 기사만!)
                 response = openai_client.embeddings.create(
                     input=chunk_text,
                     model=Config.EMBEDDING_MODEL,
@@ -218,10 +301,10 @@ def embed_and_upload(
                             "title": row.get("title"),
                             "content": chunk_text,
                             "full_content": str(content),
-                            "url": row.get("link"),
+                            "url": url,  # 중복 체크에 사용되는 필드
                             "published_at": published_at,
                             "chunk_index": i,
-                            "ingested_at": datetime.utcnow().isoformat(),
+                            "ingested_at": datetime.now(timezone.utc).isoformat(),
                         },
                     )
                 )
@@ -242,7 +325,11 @@ def embed_and_upload(
         total_uploaded += len(points)
         logger.info(f"Final batch: {len(points)} chunks (total: {total_uploaded})")
     
-    return total_uploaded
+    return {
+        "chunks_uploaded": total_uploaded,
+        "articles_skipped": articles_skipped,
+        "articles_processed": articles_processed,
+    }
 
 
 # =============================================================================
@@ -258,6 +345,9 @@ def run_incremental_ingest(
     """
     특정 시간대의 데이터만 증분 적재 (Airflow DAG에서 호출)
     
+    - URL 기반 중복 체크로 이미 적재된 기사는 스킵
+    - OpenAI API 비용 절약
+    
     Args:
         year, month, day, hour: 처리할 시간대
     
@@ -271,6 +361,9 @@ def run_incremental_ingest(
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
     
+    # 기존 컬렉션에 URL 인덱스 확인/생성
+    ensure_url_index(qdrant_client)
+    
     # 데이터 로드
     df = load_parquet_from_minio(con, year, month, day, hour)
     
@@ -279,21 +372,25 @@ def run_incremental_ingest(
         return {
             "status": "no_data",
             "articles_loaded": 0,
+            "articles_processed": 0,
+            "articles_skipped": 0,
             "chunks_uploaded": 0,
             "target_path": build_minio_path(year, month, day, hour),
         }
     
-    # 임베딩 및 적재
-    chunks_uploaded = embed_and_upload(df, qdrant_client, openai_client)
+    # 임베딩 및 적재 (중복 체크 포함)
+    result = embed_and_upload(df, qdrant_client, openai_client)
     
-    result = {
+    final_result = {
         "status": "success",
         "articles_loaded": len(df),
-        "chunks_uploaded": chunks_uploaded,
+        "articles_processed": result["articles_processed"],
+        "articles_skipped": result["articles_skipped"],
+        "chunks_uploaded": result["chunks_uploaded"],
         "target_path": build_minio_path(year, month, day, hour),
     }
-    logger.info(f"Completed: {result}")
-    return result
+    logger.info(f"Completed: {final_result}")
+    return final_result
 
 
 def run_full_ingest() -> dict:
@@ -304,17 +401,28 @@ def run_full_ingest() -> dict:
     qdrant_client = get_qdrant_client()
     openai_client = get_openai_client()
     
+    # 기존 컬렉션에 URL 인덱스 확인/생성
+    ensure_url_index(qdrant_client)
+    
     df = load_parquet_from_minio(con)  # 전체 데이터
     
     if df.empty:
-        return {"status": "no_data", "articles_loaded": 0, "chunks_uploaded": 0}
+        return {
+            "status": "no_data",
+            "articles_loaded": 0,
+            "articles_processed": 0,
+            "articles_skipped": 0,
+            "chunks_uploaded": 0,
+        }
     
-    chunks_uploaded = embed_and_upload(df, qdrant_client, openai_client)
+    result = embed_and_upload(df, qdrant_client, openai_client)
     
     return {
         "status": "success",
         "articles_loaded": len(df),
-        "chunks_uploaded": chunks_uploaded,
+        "articles_processed": result["articles_processed"],
+        "articles_skipped": result["articles_skipped"],
+        "chunks_uploaded": result["chunks_uploaded"],
     }
 
 
