@@ -1,5 +1,23 @@
+"""
+MinIO Parquet → Qdrant 임베딩 적재 모듈
+
+이 모듈은 Airflow DAG에서 호출되어 특정 시간대의 Parquet 파일을 읽고,
+OpenAI 임베딩을 생성하여 Qdrant에 적재합니다.
+
+사용 예시:
+    # 전체 데이터 적재 (로컬 테스트용)
+    python ingest_parquet_to_qdrant.py
+
+    # Airflow에서 증분 적재 (특정 시간대만)
+    from rag_pipeline.ingest_parquet_to_qdrant import run_incremental_ingest
+    run_incremental_ingest(year=2026, month=1, day=27, hour=15)
+"""
+
 import os
 import uuid
+import logging
+from typing import Optional
+from datetime import datetime
 
 import duckdb
 import pandas as pd
@@ -8,140 +26,316 @@ from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
 
-from dotenv import load_dotenv
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-load_dotenv()  # .env 파일 로드
 
-# --- 1. 설정 (Configuration) ---
+# =============================================================================
+# 설정 클래스
+# =============================================================================
 
-# MinIO에 저장된 Parquet 경로 (필요에 따라 날짜/시간 바꿔 쓰기)
-# 예: 모든 날짜/시간을 읽고 싶으면 year=*/month=*/day=*/hour=* 형태로도 가능
-MINIO_PATH = (
-    "s3://news-lake/refined/"
-    # "year=2026/month=01/day=24/hour=06/*.parquet"  # 예시
-    "year=*/month=*/day=*/hour=*/*.parquet"
-)
+class Config:
+    """환경변수 기반 설정"""
+    
+    # MinIO (S3 호환)
+    MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
+    MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
+    MINIO_BUCKET = os.getenv("MINIO_BUCKET", "news-lake")
+    
+    # Qdrant
+    QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+    QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+    COLLECTION_NAME = "crypto_news"
+    
+    # OpenAI
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    EMBEDDING_MODEL = "text-embedding-3-small"
+    EMBEDDING_DIMENSION = 1536
+    
+    # 청킹 설정
+    CHUNK_SIZE = 700
+    CHUNK_OVERLAP = 100
+    
+    # 배치 설정
+    BATCH_UPLOAD_SIZE = 100
 
-# Qdrant (docker-compose.yml 기준)
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = "crypto_news"
 
-# OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # 반드시 환경변수로 설정
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY 환경 변수를 설정하세요.")
+# =============================================================================
+# 클라이언트 초기화 함수
+# =============================================================================
 
-# MinIO (docker-compose.yml 기준)
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
+def get_qdrant_client() -> QdrantClient:
+    """Qdrant 클라이언트 생성 및 컬렉션 초기화"""
+    client = QdrantClient(host=Config.QDRANT_HOST, port=Config.QDRANT_PORT)
+    
+    # 컬렉션이 없으면 생성
+    if not client.collection_exists(Config.COLLECTION_NAME):
+        client.create_collection(
+            collection_name=Config.COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=Config.EMBEDDING_DIMENSION, 
+                distance=Distance.COSINE
+            ),
+        )
+        logger.info(f"Created Qdrant collection: {Config.COLLECTION_NAME}")
+    
+    return client
 
-# --- 2. 클라이언트 초기화 ---
 
-client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+def get_openai_client() -> OpenAI:
+    """OpenAI 클라이언트 생성"""
+    if not Config.OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY 환경 변수를 설정하세요.")
+    return OpenAI(api_key=Config.OPENAI_API_KEY)
 
-# Qdrant 컬렉션이 없으면 생성 (처음 한 번만 실행됨)
-if not client.collection_exists(COLLECTION_NAME):
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        # text-embedding-3-small 벡터 차원: 1536
-        vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+
+def get_duckdb_connection():
+    """DuckDB 연결 생성 및 MinIO(S3) 설정"""
+    con = duckdb.connect()
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute(f"""
+        SET s3_endpoint='{Config.MINIO_ENDPOINT}';
+        SET s3_access_key_id='{Config.MINIO_ACCESS_KEY}';
+        SET s3_secret_access_key='{Config.MINIO_SECRET_KEY}';
+        SET s3_use_ssl=false;
+        SET s3_url_style='path';
+    """)
+    return con
+
+
+# =============================================================================
+# 핵심 함수들
+# =============================================================================
+
+def build_minio_path(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    day: Optional[int] = None,
+    hour: Optional[int] = None,
+) -> str:
+    """
+    MinIO Parquet 경로 생성
+    
+    Args:
+        year, month, day, hour: 특정 시간대 지정 (None이면 와일드카드 사용)
+    
+    Returns:
+        S3 경로 문자열 (예: s3://news-lake/refined/year=2026/month=01/day=27/hour=15/*.parquet)
+    """
+    year_part = f"year={year:04d}" if year else "year=*"
+    month_part = f"month={month:02d}" if month else "month=*"
+    day_part = f"day={day:02d}" if day else "day=*"
+    hour_part = f"hour={hour:02d}" if hour else "hour=*"
+    
+    return f"s3://{Config.MINIO_BUCKET}/refined/{year_part}/{month_part}/{day_part}/{hour_part}/*.parquet"
+
+
+def load_parquet_from_minio(
+    con,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    day: Optional[int] = None,
+    hour: Optional[int] = None,
+) -> pd.DataFrame:
+    """MinIO에서 Parquet 파일 로드"""
+    minio_path = build_minio_path(year, month, day, hour)
+    logger.info(f"Loading data from: {minio_path}")
+    
+    try:
+        df = con.execute(f"""
+            SELECT
+                title,
+                content,
+                link,
+                published_at,
+                source
+            FROM read_parquet('{minio_path}')
+        """).df()
+        logger.info(f"Loaded {len(df)} articles")
+        return df
+    except Exception as e:
+        logger.warning(f"No data found at {minio_path}: {e}")
+        return pd.DataFrame()
+
+
+def embed_and_upload(
+    df: pd.DataFrame,
+    qdrant_client: QdrantClient,
+    openai_client: OpenAI,
+) -> int:
+    """
+    DataFrame의 기사들을 임베딩하고 Qdrant에 적재
+    
+    Returns:
+        적재된 청크 수
+    """
+    if df.empty:
+        logger.info("No data to process")
+        return 0
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=Config.CHUNK_SIZE,
+        chunk_overlap=Config.CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ".", " ", ""],
     )
-
-# --- 3. DuckDB로 MinIO Parquet 읽기 ---
-
-con = duckdb.connect()
-con.execute("INSTALL httpfs; LOAD httpfs;")
-
-con.execute(f"""
-    SET s3_endpoint='{MINIO_ENDPOINT}';
-    SET s3_access_key_id='{MINIO_ACCESS_KEY}';
-    SET s3_secret_access_key='{MINIO_SECRET_KEY}';
-    SET s3_use_ssl=false;
-    SET s3_url_style='path';
-""")
-
-print(f"Loading data from: {MINIO_PATH}")
-
-# 우리의 Parquet 스키마에 맞춰 컬럼 선택
-# news_refine_stream_pandas.py 에서 저장한 컬럼:
-# title, link, published_at, content, content_length, crawled_at, source, year, month, day, hour, min
-df = con.execute(f"""
-    SELECT
-        title,
-        content,
-        link,
-        published_at,
-        source
-    FROM read_parquet('{MINIO_PATH}')
-""").df()
-
-print(f"Total articles loaded: {len(df)}")
-
-# --- 4. 청킹 (Chunking) 설정 ---
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,      # 한 덩어리 크기 (문자 기준)
-    chunk_overlap=100,   # 문맥 유지를 위해 겹치는 구간
-    separators=["\n\n", "\n", ".", " ", ""],
-)
-
-# --- 5. 임베딩 및 Qdrant 적재 ---
-
-points = []
-BATCH_UPLOAD_SIZE = 100  # Qdrant로 업로드할 청크 수 기준
-
-for index, row in df.iterrows():
-    content = row.get("content")
-    if not content:
-        continue
-
-    # 5-1. 텍스트 청킹
-    chunks = text_splitter.split_text(content)
-
-    for i, chunk_text in enumerate(chunks):
-        try:
-            # 5-2. OpenAI 임베딩
-            response = openai_client.embeddings.create(
-                input=chunk_text,
-                model="text-embedding-3-small",
-            )
-            vector = response.data[0].embedding
-
-            # 5-3. Qdrant Point 생성
-            published_at = row.get("published_at")
-            if isinstance(published_at, pd.Timestamp):
-                published_at = published_at.isoformat()
-
-            points.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vector,
-                    payload={
-                        "source": row.get("source"),
-                        "title": row.get("title"),
-                        "content": chunk_text,             # 이 청크 자체
-                        "full_content": content,           # 전체 본문
-                        "url": row.get("link"),           # 우리 스키마에서는 link 컬럼
-                        "published_at": published_at,
-                        "chunk_index": i,
-                    },
+    
+    points = []
+    total_uploaded = 0
+    
+    for index, row in df.iterrows():
+        content = row.get("content")
+        if not content:
+            continue
+        
+        # 텍스트 청킹
+        chunks = text_splitter.split_text(str(content))
+        
+        for i, chunk_text in enumerate(chunks):
+            try:
+                # OpenAI 임베딩 생성
+                response = openai_client.embeddings.create(
+                    input=chunk_text,
+                    model=Config.EMBEDDING_MODEL,
                 )
-            )
-        except Exception as e:
-            print(f"Error embedding chunk (row={index}, chunk={i}): {e}")
+                vector = response.data[0].embedding
+                
+                # published_at 처리
+                published_at = row.get("published_at")
+                if isinstance(published_at, pd.Timestamp):
+                    published_at = published_at.isoformat()
+                elif published_at is not None:
+                    published_at = str(published_at)
+                
+                # Qdrant Point 생성
+                points.append(
+                    PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=vector,
+                        payload={
+                            "source": row.get("source"),
+                            "title": row.get("title"),
+                            "content": chunk_text,
+                            "full_content": str(content),
+                            "url": row.get("link"),
+                            "published_at": published_at,
+                            "chunk_index": i,
+                            "ingested_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Error embedding chunk (row={index}, chunk={i}): {e}")
+                raise  # Airflow 재시도를 위해 예외 전파
+        
+        # 배치 업로드
+        if len(points) >= Config.BATCH_UPLOAD_SIZE:
+            qdrant_client.upsert(collection_name=Config.COLLECTION_NAME, points=points)
+            total_uploaded += len(points)
+            logger.info(f"Uploaded batch: {len(points)} chunks (total: {total_uploaded})")
+            points = []
+    
+    # 남은 데이터 업로드
+    if points:
+        qdrant_client.upsert(collection_name=Config.COLLECTION_NAME, points=points)
+        total_uploaded += len(points)
+        logger.info(f"Final batch: {len(points)} chunks (total: {total_uploaded})")
+    
+    return total_uploaded
 
-    # (옵션) 메모리 관리를 위해 일정 개수마다 업로드
-    if len(points) >= BATCH_UPLOAD_SIZE:
-        client.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"Uploaded {len(points)} chunks to Qdrant.")
-        points = []
 
-# 남은 데이터 업로드
-if points:
-    client.upsert(collection_name=COLLECTION_NAME, points=points)
-    print(f"Final upload: {len(points)} chunks.")
+# =============================================================================
+# Airflow에서 호출할 메인 함수
+# =============================================================================
 
-print("Job Finished!")
+def run_incremental_ingest(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+) -> dict:
+    """
+    특정 시간대의 데이터만 증분 적재 (Airflow DAG에서 호출)
+    
+    Args:
+        year, month, day, hour: 처리할 시간대
+    
+    Returns:
+        처리 결과 딕셔너리 (XCom으로 전달 가능)
+    """
+    logger.info(f"Starting incremental ingest for {year}/{month:02d}/{day:02d}/{hour:02d}")
+    
+    # 클라이언트 초기화
+    con = get_duckdb_connection()
+    qdrant_client = get_qdrant_client()
+    openai_client = get_openai_client()
+    
+    # 데이터 로드
+    df = load_parquet_from_minio(con, year, month, day, hour)
+    
+    if df.empty:
+        logger.info("No new data to process")
+        return {
+            "status": "no_data",
+            "articles_loaded": 0,
+            "chunks_uploaded": 0,
+            "target_path": build_minio_path(year, month, day, hour),
+        }
+    
+    # 임베딩 및 적재
+    chunks_uploaded = embed_and_upload(df, qdrant_client, openai_client)
+    
+    result = {
+        "status": "success",
+        "articles_loaded": len(df),
+        "chunks_uploaded": chunks_uploaded,
+        "target_path": build_minio_path(year, month, day, hour),
+    }
+    logger.info(f"Completed: {result}")
+    return result
+
+
+def run_full_ingest() -> dict:
+    """전체 데이터 적재 (초기 로드 또는 테스트용)"""
+    logger.info("Starting full ingest (all data)")
+    
+    con = get_duckdb_connection()
+    qdrant_client = get_qdrant_client()
+    openai_client = get_openai_client()
+    
+    df = load_parquet_from_minio(con)  # 전체 데이터
+    
+    if df.empty:
+        return {"status": "no_data", "articles_loaded": 0, "chunks_uploaded": 0}
+    
+    chunks_uploaded = embed_and_upload(df, qdrant_client, openai_client)
+    
+    return {
+        "status": "success",
+        "articles_loaded": len(df),
+        "chunks_uploaded": chunks_uploaded,
+    }
+
+
+# =============================================================================
+# 직접 실행 시 (로컬 테스트)
+# =============================================================================
+
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    import sys
+    
+    if len(sys.argv) == 5:
+        # 특정 시간대 증분 적재: python ingest_parquet_to_qdrant.py 2026 1 27 15
+        year, month, day, hour = map(int, sys.argv[1:5])
+        result = run_incremental_ingest(year, month, day, hour)
+    else:
+        # 전체 적재
+        result = run_full_ingest()
+    
+    print(f"\n{'='*50}")
+    print("Job Finished!")
+    print(f"Result: {result}")
