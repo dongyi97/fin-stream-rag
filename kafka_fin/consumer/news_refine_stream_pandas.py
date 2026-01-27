@@ -15,16 +15,19 @@ import boto3
 # 설정
 # =========================
 
-# KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092") # 도커 내부 에서 돌릴 때
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092") # 도커 외부에서 돌릴 때
+# Kafka 설정
+# - Docker 내부: kafka:29092 (docker-compose에서 환경변수로 설정됨)
+# - Docker 외부 (로컬 테스트): localhost:9092
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 KAFKA_TOPICS = [
     "coindesk-news",
     "coinness-breaking",
     "coinness-newsroom",
 ]
 
-# MinIO(S3 호환) 설정 - docker-compose.yml 기준
-# MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+# MinIO(S3 호환) 설정
+# - Docker 내부: http://minio:9000 (docker-compose에서 환경변수로 설정됨)
+# - Docker 외부 (로컬 테스트): http://localhost:9000
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
