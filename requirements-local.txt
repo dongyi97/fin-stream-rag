@@ -17,3 +17,5 @@ confluent-kafka
 websocket-client
 langchain_text_splitters
 python-dotenv
+streamlit
+requests
