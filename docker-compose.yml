@@ -104,14 +104,57 @@ services:
     volumes:
       - ./dags:/opt/airflow/dags
       - ./kafka_fin:/opt/airflow/kafka_fin
+      - ./rag_pipeline:/opt/airflow/rag_pipeline
     ports:
       - "8080:8080"
     networks:
       - fin-network
+    environment:
+      # MinIO (S3 호환) 설정
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+      - MINIO_BUCKET=news-lake
+      # Qdrant 설정
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      # OpenAI API 키 (docker-compose 실행 시 환경변수로 전달 필요)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Airflow AWS Provider용 (MinIO를 S3처럼 사용)
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password123
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      - minio
+      - qdrant
     command: airflow standalone
 
 
-  # 5. Distributed Processing
+  # 6. Kafka Consumer (뉴스 정제 → MinIO 저장)
+  news-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile-consumer
+    container_name: news-consumer
+    networks:
+      - fin-network
+    environment:
+      # Docker 내부 네트워크 주소 사용
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=admin
+      - MINIO_SECRET_KEY=password123
+      - MINIO_BUCKET=news-lake
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: always
+    # 로그 실시간 출력을 위해 -u (unbuffered) 옵션 사용
+    command: ["python", "-u", "kafka_fin/consumer/news_refine_stream_pandas.py"]
+
+  # 7. Distributed Processing
   spark-master:
     image: apache/spark:3.5.1
     container_name: spark-master

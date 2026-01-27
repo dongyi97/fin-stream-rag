@@ -7,3 +7,13 @@ beautifulsoup4
 feedparser
 trafilatura
 boto3
+
+# RAG Pipeline (Airflow에서 임베딩 및 Qdrant 적재용)
+duckdb
+openai
+qdrant-client
+langchain-text-splitters
+python-dotenv
+
+# Airflow S3 Sensor용
+apache-airflow-providers-amazon

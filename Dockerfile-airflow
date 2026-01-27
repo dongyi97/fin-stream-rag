@@ -9,3 +9,6 @@ USER airflow
 # 도커 전용 requirements 파일 복사 및 설치
 COPY requirements-docker.txt /requirements-docker.txt
 RUN pip install --no-cache-dir -r /requirements-docker.txt
+
+# rag_pipeline 모듈 경로를 PYTHONPATH에 추가
+ENV PYTHONPATH="${PYTHONPATH}:/opt/airflow/rag_pipeline"
