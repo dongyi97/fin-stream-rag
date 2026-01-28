@@ -16,6 +16,7 @@ env/
 # Data directories (local storage)
 kafka_data/
 qdrant_storage/
+trade_data/
 
 # IDE
 .vscode/
