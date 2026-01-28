@@ -1,5 +1,6 @@
 yfinance
 kafka-python
+python-snappy  # Kafka snappy 압축 지원
 pandas
 pyarrow
 selenium

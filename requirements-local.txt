@@ -19,3 +19,4 @@ langchain_text_splitters
 python-dotenv
 streamlit
 requests
+python-snappy
