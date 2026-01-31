@@ -7,7 +7,7 @@ from io import BytesIO
 from typing import List, Dict, Any
 
 import pandas as pd
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 import boto3
 
 
@@ -24,6 +24,8 @@ KAFKA_TOPICS = [
     "coinness-breaking",
     "coinness-newsroom",
 ]
+# news_embedding_stream.py 가 구독하는 통합 토픽 (정제된 뉴스 전송)
+KAFKA_TOPIC_NEWS_RAW = os.getenv("KAFKA_TOPIC_NEWS_RAW", "news-raw")
 
 # MinIO(S3 호환) 설정
 # - Docker 내부: http://minio:9000 (docker-compose에서 환경변수로 설정됨)
@@ -189,6 +191,31 @@ def write_batch_to_minio(df: pd.DataFrame, s3) -> None:
         print(f"[MinIO] Wrote batch to s3://{MINIO_BUCKET}/{key}")
 
 
+def _row_to_news_raw_payload(row: pd.Series) -> Dict[str, Any]:
+    """embedding consumer(news-raw)용 payload: link, content 등 직렬화."""
+    d = row.to_dict()
+    out = {}
+    for k, v in d.items():
+        if pd.isna(v):
+            out[k] = None
+        elif hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+def send_batch_to_news_raw(df: pd.DataFrame, producer: KafkaProducer) -> None:
+    """정제된 배치를 news-raw 토픽으로 전송 (news_embedding_stream.py가 소비)."""
+    if df.empty:
+        return
+    for _, row in df.iterrows():
+        payload = _row_to_news_raw_payload(row)
+        producer.send(KAFKA_TOPIC_NEWS_RAW, payload)
+    producer.flush()
+    print(f"[Kafka] Sent {len(df)} records to topic={KAFKA_TOPIC_NEWS_RAW}")
+
+
 def consume_and_process(batch_size: int = 500, max_batches: int = None) -> None:
     """
     Kafka에서 JSON 메시지를 읽어 Pandas로 전처리 후 MinIO에 저장.
@@ -205,11 +232,16 @@ def consume_and_process(batch_size: int = 500, max_batches: int = None) -> None:
         enable_auto_commit=True,
         value_deserializer=lambda v: v.decode("utf-8"),
     )
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    )
 
     print(
         f"[Kafka] Consuming from {KAFKA_TOPICS} "
         f"@ {KAFKA_BOOTSTRAP_SERVERS} (batch_size={batch_size})"
     )
+    print(f"[Kafka] Producing refined records to topic={KAFKA_TOPIC_NEWS_RAW}")
 
     s3 = _create_minio_client()
     _ensure_bucket_exists(s3)
@@ -232,6 +264,7 @@ def consume_and_process(batch_size: int = 500, max_batches: int = None) -> None:
                 print(f"[Batch {batch_count}] Processing {len(buffer)} records...")
                 df = transform_records(buffer)
                 write_batch_to_minio(df, s3)
+                send_batch_to_news_raw(df, producer)
                 buffer.clear()
 
                 if max_batches is not None and batch_count >= max_batches:
@@ -244,6 +277,8 @@ def consume_and_process(batch_size: int = 500, max_batches: int = None) -> None:
             print(f"[Final Batch] Processing {len(buffer)} records...")
             df = transform_records(buffer)
             write_batch_to_minio(df, s3)
+            send_batch_to_news_raw(df, producer)
+        producer.close()
         consumer.close()
 
 
