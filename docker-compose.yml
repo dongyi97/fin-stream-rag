@@ -179,6 +179,29 @@ services:
     restart: always
     command: ["python", "-u", "kafka_fin/consumer/bitcoin_trade_stream.py", "100"]
 
+  # 6-3. Kafka Consumer (news-raw → 임베딩 → Qdrant)
+  embedding-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile-consumer
+    container_name: embedding-consumer
+    networks:
+      - fin-network
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_SOURCE_TOPIC=news-raw
+      - KAFKA_DLQ_TOPIC=news-dlq-failed
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: always
+    command: ["python", "-u", "kafka_fin/consumer/news_embedding_stream.py"]
+
   # 7. Distributed Processing
   spark-master:
     image: apache/spark:3.5.1
