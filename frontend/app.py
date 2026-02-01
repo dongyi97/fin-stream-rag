@@ -9,8 +9,8 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🤖 가상자산 뉴스 챗봇")
-st.markdown("실시간 수집된 뉴스를 바탕으로 답변합니다.")
+st.title("🤖 가상자산 챗봇")
+st.markdown("뉴스나 비트코인 거래 데이터를 한 번에 물어보세요. 질문에 맞춰 자동으로 검색·조회합니다.")
 
 # API 설정
 API_BASE_URL = st.sidebar.text_input(
@@ -27,10 +27,9 @@ if "messages" not in st.session_state:
 with st.sidebar:
     st.header("ℹ️ 정보")
     st.markdown("""
-    이 챗봇은 다음 기능을 제공합니다:
-    - 실시간 가상자산 뉴스 검색
-    - 뉴스 기반 질의응답
-    - 참고 뉴스 출처 제공
+    한 질문으로 다음을 모두 처리합니다:
+    - **뉴스**: 실시간 가상자산 뉴스 검색·질의응답, 참고 뉴스 출처
+    - **비트코인 거래**: 평균가·거래량 등 DuckDB 집계 질의
     """)
     
     # API 상태 확인
@@ -68,7 +67,7 @@ for message in st.session_state.messages:
                         st.divider()
 
 # 사용자 입력 받기
-if prompt := st.chat_input("궁금한 코인 소식을 물어보세요! (예: 비트코인 가격은 어떻게 되나요?)"):
+if prompt := st.chat_input("뉴스나 비트코인 거래 데이터를 물어보세요 (예: 비트코인 뉴스, 최근 1시간 평균가)"):
     # 사용자 메시지 추가 및 표시
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -76,13 +75,12 @@ if prompt := st.chat_input("궁금한 코인 소식을 물어보세요! (예: �
 
     # FastAPI 서버에 요청
     with st.chat_message("assistant"):
-        with st.spinner("뉴스를 분석 중입니다..."):
+        with st.spinner("답변을 생성 중입니다..."):
             try:
-                # API 호출
                 response = requests.get(
                     f"{API_BASE_URL}/ask",
                     params={"question": prompt, "limit": 3},
-                    timeout=30,
+                    timeout=60,
                 )
                 response.raise_for_status()  # HTTP 에러 체크
                 

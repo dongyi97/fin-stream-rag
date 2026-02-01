@@ -154,7 +154,7 @@ services:
     # 로그 실시간 출력을 위해 -u (unbuffered) 옵션 사용
     command: ["python", "-u", "kafka_fin/consumer/news_refine_stream_pandas.py"]
 
-  # 6-2. Kafka Consumer (비트코인 거래 → Bronze/Silver/DuckDB)
+  # 6-2. Kafka Consumer (비트코인 거래 → MinIO Bronze/Silver Parquet)
   trade-consumer:
     build:
       context: .
@@ -168,9 +168,6 @@ services:
       - MINIO_ACCESS_KEY=admin
       - MINIO_SECRET_KEY=password123
       - MINIO_BUCKET=trade-lake
-      - DUCKDB_PATH=/app/data/bitcoin_analytics.db
-    volumes:
-      - ./trade_data:/app/data  # DuckDB 파일 영속화
     depends_on:
       kafka:
         condition: service_healthy

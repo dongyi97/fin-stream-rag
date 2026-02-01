@@ -1,10 +1,9 @@
 """
 Bitcoin Trade Stream Consumer
 
-Binance BTC/USDT 거래 데이터를 Kafka에서 소비하여:
-1. Bronze Layer: 원본 JSON을 그대로 Parquet로 저장
-2. Silver Layer: 정제된 데이터를 Parquet로 저장
-3. DuckDB: 실시간 분석용 테이블에 적재 (Upsert)
+Binance BTC/USDT 거래 데이터를 Kafka에서 소비하여 MinIO에 Parquet로 저장합니다.
+- Bronze Layer: 원본 JSON을 그대로 Parquet로 저장
+- Silver Layer: 정제된 데이터를 Parquet로 저장 (Backend는 MinIO Silver를 DuckDB read_parquet로 조회)
 
 사용 예시:
     # Docker 내부 실행 (환경변수로 설정됨)
@@ -22,7 +21,6 @@ from io import BytesIO
 from typing import List, Dict, Any
 
 import pandas as pd
-import duckdb
 from kafka import KafkaConsumer
 import boto3
 
@@ -45,14 +43,9 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "password123")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "trade-lake")
 
-# DuckDB 설정
-# - Docker 내부에서는 /app/data에 저장
-# - 로컬에서는 현재 디렉토리에 저장
-DUCKDB_PATH = os.getenv("DUCKDB_PATH", "bitcoin_analytics.db")
-
 # S3 경로
 BRONZE_PREFIX = "bronze"  # 원본 데이터
-SILVER_PREFIX = "silver"  # 정제 데이터
+SILVER_PREFIX = "silver"  # 정제 데이터 (Backend DuckDB가 read_parquet로 조회)
 
 
 # =============================================================================
@@ -78,32 +71,6 @@ def ensure_bucket_exists(s3) -> None:
     except Exception:
         s3.create_bucket(Bucket=MINIO_BUCKET)
         print(f"[MinIO] Created bucket: {MINIO_BUCKET}")
-
-
-# =============================================================================
-# DuckDB 초기화
-# =============================================================================
-
-def init_duckdb() -> duckdb.DuckDBPyConnection:
-    """DuckDB 연결 생성 및 테이블 초기화"""
-    con = duckdb.connect(DUCKDB_PATH)
-    
-    # trades 테이블 생성 (trade_id를 PK로 사용하여 멱등성 보장)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            trade_id BIGINT PRIMARY KEY,
-            symbol VARCHAR,
-            price DOUBLE,
-            quantity DOUBLE,
-            amount DOUBLE,
-            side VARCHAR,
-            trade_time TIMESTAMP,
-            received_at TIMESTAMP
-        )
-    """)
-    
-    print(f"[DuckDB] Initialized at {DUCKDB_PATH}")
-    return con
 
 
 # =============================================================================
@@ -234,49 +201,18 @@ def write_to_minio(df: pd.DataFrame, s3, prefix: str, file_prefix: str) -> None:
         print(f"[MinIO] Wrote {len(group)} records to s3://{MINIO_BUCKET}/{key}")
 
 
-def write_to_duckdb(df: pd.DataFrame, con: duckdb.DuckDBPyConnection) -> None:
-    """Silver DataFrame을 DuckDB에 Upsert (trade_id 기준 중복 무시)"""
-    if df.empty:
-        return
-    
-    # DuckDB에 저장할 컬럼만 선택
-    db_cols = ["trade_id", "symbol", "price", "quantity", "amount", "side", "trade_time", "received_at"]
-    save_df = df[db_cols].copy()
-    
-    # DataFrame을 임시 테이블로 등록
-    con.register("temp_trades", save_df)
-    
-    # INSERT OR IGNORE: trade_id 중복 시 무시 (멱등성)
-    con.execute("""
-        INSERT OR IGNORE INTO trades 
-        SELECT * FROM temp_trades
-    """)
-    
-    # 임시 테이블 해제
-    con.unregister("temp_trades")
-    
-    print(f"[DuckDB] Upserted {len(save_df)} records")
-
-
-def save_batch(
-    raw_buffer: List[Dict[str, Any]],
-    s3,
-    con: duckdb.DuckDBPyConnection,
-) -> None:
-    """배치를 Bronze, Silver, DuckDB에 저장"""
+def save_batch(raw_buffer: List[Dict[str, Any]], s3) -> None:
+    """배치를 Bronze, Silver(MinIO Parquet)에 저장"""
     now = datetime.now(timezone.utc)
-    
+
     # 1. Bronze 저장 (원본 JSON)
     bronze_df = transform_to_bronze(raw_buffer)
     write_to_minio(bronze_df, s3, BRONZE_PREFIX, "raw")
-    
-    # 2. Silver 저장 (정제 데이터)
+
+    # 2. Silver 저장 (정제 데이터, Backend가 read_parquet로 조회)
     silver_df = transform_to_silver(raw_buffer)
     write_to_minio(silver_df, s3, SILVER_PREFIX, "trades")
-    
-    # 3. DuckDB 저장 (실시간 분석용)
-    write_to_duckdb(silver_df, con)
-    
+
     print(f"[Batch Complete] {len(raw_buffer)} records processed at {now.isoformat()}")
 
 
@@ -286,72 +222,54 @@ def save_batch(
 
 def consume_and_process(batch_size: int = 100, max_batches: int = None) -> None:
     """
-    Kafka에서 거래 데이터를 읽어 Bronze/Silver/DuckDB에 저장
-    
+    Kafka에서 거래 데이터를 읽어 MinIO Bronze/Silver(Parquet)에 저장
+
     Args:
         batch_size: 배치 크기 (이 개수만큼 모이면 저장)
         max_batches: 최대 배치 수 (None이면 무한 실행)
     """
     print(f"[START] Connecting Kafka at {KAFKA_BOOTSTRAP_SERVERS}, topic={KAFKA_TOPIC}")
     print(f"[START] MinIO endpoint: {MINIO_ENDPOINT}, bucket: {MINIO_BUCKET}")
-    print(f"[START] DuckDB path: {DUCKDB_PATH}")
-    
-    # Kafka Consumer 초기화
+
     consumer = KafkaConsumer(
         KAFKA_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        auto_offset_reset="latest",  # 최신 메시지부터 소비
+        auto_offset_reset="latest",
         enable_auto_commit=True,
         value_deserializer=lambda v: v.decode("utf-8"),
     )
-    
     print(f"[Kafka] Connected! Consuming from {KAFKA_TOPIC} (batch_size={batch_size})")
-    
-    # MinIO 클라이언트 초기화
+
     s3 = create_minio_client()
     ensure_bucket_exists(s3)
-    
-    # DuckDB 초기화
-    con = init_duckdb()
-    
-    # 버퍼 및 카운터
+
     buffer: List[Dict[str, Any]] = []
     batch_count = 0
-    
+
     try:
         for msg in consumer:
-            # 메시지 파싱
             try:
                 payload = json.loads(msg.value)
                 buffer.append(payload)
             except json.JSONDecodeError:
                 print(f"[WARN] Invalid JSON skipped: {msg.value[:100]}")
                 continue
-            
-            # 배치 크기 도달 시 저장
+
             if len(buffer) >= batch_size:
                 batch_count += 1
                 print(f"\n[Batch {batch_count}] Processing {len(buffer)} records...")
-                
-                save_batch(buffer, s3, con)
+                save_batch(buffer, s3)
                 buffer.clear()
-                
-                # 최대 배치 수 도달 시 종료
                 if max_batches is not None and batch_count >= max_batches:
                     print("[INFO] Reached max_batches, exiting.")
                     break
-                    
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user, flushing remaining records...")
     finally:
-        # 남은 버퍼 저장
         if buffer:
             print(f"[Final Batch] Processing {len(buffer)} records...")
-            save_batch(buffer, s3, con)
-        
-        # 리소스 정리
+            save_batch(buffer, s3)
         consumer.close()
-        con.close()
         print("[SHUTDOWN] Consumer closed gracefully")
 
 
