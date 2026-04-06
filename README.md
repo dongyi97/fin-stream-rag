@@ -55,6 +55,11 @@
 ## 아키텍처
 
 ### 데이터 플로우
+#### 1) 뉴스 파이프라인
+<img src="docs/dataflow.png" width="700" />
+
+#### 2) 챗봇 파이프라인
+<img src="docs/chatbotflow.png" width="700" />
 
 ```
 [뉴스 파이프라인]
@@ -176,6 +181,13 @@ docker-compose up -d
 | Spark Master | http://localhost:8083 | Spark 클러스터 현황 |
 
 ---
+## 최종 결과
+
+#### 1) 답변
+<img src="docs/result1.png" width="700" />
+
+#### 2) 출처
+<img src="docs/result2.png" width="700" />
 
 ## 이슈 및 해결 과정
 
